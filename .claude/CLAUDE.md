@@ -11,3 +11,4 @@ Ask before any destructive action along with why its needed and what is being re
 ## Strategic mandate (read before anything else)
 
 Always adhere to PRD.md and Verification.md along with MEMORY.md to check current status of project against these.
+This project serves as a learning project, so keep asking questions and explaining things.
