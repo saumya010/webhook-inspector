@@ -28,3 +28,6 @@ coverage/
 
 # Docker volumes / local data (if ever bind-mounted instead of named volumes)
 mongo_data/
+
+.claude/CLAUDE.md
+.claude/MEMORY.md
