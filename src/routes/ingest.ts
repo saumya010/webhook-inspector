@@ -3,6 +3,7 @@ import { MongoServerError, ObjectId } from "mongodb";
 import { getDb } from "../db/client.js";
 import { verifySignature } from "../verification/schemes.js";
 import { deriveIdempotencyKey } from "../verification/idempotency.js";
+import { enqueueDelivery } from "../queue/delivery-queue.js";
 import type { DeliveryDoc, EndpointDoc } from "../types/models.js";
 
 const MAX_BODY_BYTES = 1024 * 1024; // 1MB cap — PRD §6
@@ -110,7 +111,7 @@ export async function registerIngestRoute(app: FastifyInstance): Promise<void> {
           failure_reason: failureReason,
           verified_at: verificationStatus === "passed" ? now : null,
         },
-        status: "received",
+        status: "queued",
         attempts: [],
         attempt_count: 0,
         claimed_at: null,
@@ -121,8 +122,11 @@ export async function registerIngestRoute(app: FastifyInstance): Promise<void> {
 
       try {
         const inserted = await deliveries.insertOne(doc);
-        // Enqueueing happens in M2 once BullMQ is wired in; for now the
-        // delivery is persisted as `received` and queuing is a no-op.
+        // Ingest never blocks on delivery (PRD §4) — the 202 below is sent
+        // as soon as the delivery is persisted and enqueued, not after any
+        // forwarding attempt. enqueueDelivery() only adds a job to Redis;
+        // it does not await the worker picking it up.
+        await enqueueDelivery(inserted.insertedId.toString());
         return reply.code(202).send({ delivery_id: inserted.insertedId.toString(), duplicate: false });
       } catch (err) {
         if (err instanceof MongoServerError && err.code === 11000) {

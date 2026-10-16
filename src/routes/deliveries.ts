@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ObjectId } from "mongodb";
 import { getDb } from "../db/client.js";
+import { enqueueDelivery } from "../queue/delivery-queue.js";
 import type { DeliveryDoc, DeliveryStatus, VerificationStatus } from "../types/models.js";
 
 interface ListQuery {
@@ -97,13 +98,15 @@ export async function registerDeliveryRoutes(app: FastifyInstance): Promise<void
       const doc = await deliveries().findOne({ _id: id });
       if (!doc) return reply.code(404).send({ error: "not_found" });
 
-      // Reset to queued for re-delivery. Actual enqueueing onto BullMQ
-      // arrives in M2 — for now this flips state so the intent is visible
-      // and testable independent of the queue.
+      // Reset to queued and re-enqueue so a worker picks it up. Both the
+      // original status (e.g. 'dead') and the retry/claim fields are
+      // cleared in one write — a delivery must never be left half in its
+      // old terminal state and half reset.
       await deliveries().updateOne(
         { _id: id },
         { $set: { status: "queued", claimed_at: null, next_retry_at: null } },
       );
+      await enqueueDelivery(id.toString());
 
       return reply.send({ data: { delivery_id: id.toString(), status: "queued" } });
     },

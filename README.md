@@ -7,7 +7,7 @@ API for debugging failed integrations.
 
 See [`PRD.md`](./PRD.md) for the full design doc, rationale, and milestones.
 
-## Status: M1 (core) complete
+## Status: M1 + M2 complete
 
 What exists right now:
 
@@ -18,15 +18,21 @@ What exists right now:
 - `GET/POST/PATCH /api/endpoints`, `GET /api/deliveries` (cursor-paginated,
   filterable), `GET /api/deliveries/:id`, `POST /api/deliveries/:id/replay`,
   `GET /api/deliveries/stats` (aggregation pipeline)
-- `/healthz`, `/readyz`
-- Docker Compose stack (`app` + `mongo`), verified booting end-to-end
+- `/healthz`, `/readyz` (Mongo + Redis)
+- BullMQ queue + worker: atomic claim (`findOneAndUpdate` with `status:
+  'queued'` in the filter), real HTTP delivery to configured destinations,
+  retry classification + jittered exponential backoff, a retry scanner that
+  re-enqueues deliveries once `next_retry_at` passes, a stale-claim sweep
+  that reclaims deliveries stuck in `delivering` after a dead worker
+- Docker Compose stack (`app` + `worker` + `mongo` + `redis`), verified
+  booting end-to-end and delivering a real webhook through to a live
+  destination, including the full retry → dead → replay → delivered path
 - Vitest unit suite: signature verification (incl. timing-safe comparison
   and replay-window rejection), idempotency key derivation, retry
   classification (table-driven), backoff/jitter bounds — 35 tests passing
 
-Not yet built (see PRD milestones M2–M4): the BullMQ queue/worker, actual
-delivery attempts to destinations, stale-claim sweep, OTel/Prometheus/
-Grafana, the MCP server, and k6 load tests.
+Not yet built (see PRD milestones M3–M4): OTel tracing, Prometheus
+`/metrics`, Grafana dashboard, the MCP server, and k6 load tests.
 
 ## Running it
 
