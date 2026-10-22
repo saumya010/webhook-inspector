@@ -6,10 +6,14 @@ services:
     environment:
       MONGO_URL: mongodb://mongo:27017
       MONGO_DB_NAME: webhook_inspector
+      MONGO_MAX_POOL_SIZE: ${MONGO_MAX_POOL_SIZE:-20}
       REDIS_URL: redis://redis:6379
       API_KEY: ${API_KEY:-dev-local-key}
       PORT: 3000
       WEBHOOK_SECRET_GENERIC_TEST: test-secret-123
+      WEBHOOK_SECRET_K6_LOAD_TEST: k6-load-secret
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      OTEL_SERVICE_NAME: webhook-inspector-app
     depends_on:
       mongo:
         condition: service_healthy
@@ -19,11 +23,16 @@ services:
   worker:
     build: .
     command: ["node", "dist/worker.js"]
+    ports:
+      - "3001:3001"
     environment:
       MONGO_URL: mongodb://mongo:27017
       MONGO_DB_NAME: webhook_inspector
       REDIS_URL: redis://redis:6379
       WEBHOOK_SECRET_GENERIC_TEST: test-secret-123
+      WEBHOOK_SECRET_K6_LOAD_TEST: k6-load-secret
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      OTEL_SERVICE_NAME: webhook-inspector-worker
     depends_on:
       mongo:
         condition: service_healthy
@@ -51,6 +60,35 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  jaeger:
+    image: jaegertracing/all-in-one:1
+    ports:
+      - "16686:16686" # UI
+      - "4318:4318"   # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports:
+      - "3002:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./observability/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./observability/grafana-dashboard-provider.yml:/etc/grafana/provisioning/dashboards/provider.yml:ro
+      - ./observability/grafana-dashboard.json:/var/lib/grafana/dashboards/webhook-inspector.json:ro
+    depends_on:
+      - prometheus
 
 volumes:
   mongo_data:

@@ -1,3 +1,6 @@
+import { startTracing } from "./observability/tracing.js";
+startTracing(); // must run before any instrumented module is imported
+
 import Fastify from "fastify";
 import { connectMongo } from "./db/client.js";
 import { ensureIndexes } from "./db/indexes.js";
@@ -5,6 +8,7 @@ import { registerHealthRoutes } from "./routes/health.js";
 import { registerIngestRoute } from "./routes/ingest.js";
 import { registerEndpointRoutes } from "./routes/endpoints.js";
 import { registerDeliveryRoutes } from "./routes/deliveries.js";
+import { registerMetricsRoute } from "./routes/metrics.js";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const API_KEY = process.env.API_KEY;
@@ -51,6 +55,7 @@ async function main() {
   await ensureIndexes((await connectMongo()));
 
   await registerHealthRoutes(app);
+  await registerMetricsRoute(app);
   await registerIngestRoute(app);
   await registerEndpointRoutes(app);
   await registerDeliveryRoutes(app);

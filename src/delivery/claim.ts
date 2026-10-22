@@ -16,13 +16,22 @@ const STALE_CLAIM_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes, per PRD §7.2
  * reimplementation drill (Phase 4).
  */
 export async function claimDelivery(deliveryId: string): Promise<DeliveryDoc | null> {
+  // PHASE 4 DRILL: implementation removed. Write the atomic claim here
+  // from memory — no reference, no autocomplete assistance, no searching
+  // the repo. See Verification.md Phase 4.
+  // check if deliveryid is a valid ObjectId
+  if (!ObjectId.isValid(deliveryId)) {
+    throw new Error("Invalid deliveryId");
+  }
+  // insert the deliveryId into the deliveries collection and set the status to 'delivering' and claimed_at to current date
   const deliveries = getDb().collection<DeliveryDoc>("deliveries");
   const result = await deliveries.findOneAndUpdate(
     { _id: new ObjectId(deliveryId), status: "queued" },
     { $set: { status: "delivering", claimed_at: new Date() } },
-    { returnDocument: "after" },
+    { returnDocument: "after" }
   );
   return result;
+  throw new Error("not implemented — Phase 4 drill in progress");
 }
 
 /**

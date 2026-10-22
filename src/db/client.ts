@@ -10,7 +10,7 @@ export async function connectMongo(): Promise<Db> {
   if (db) return db;
 
   client = new MongoClient(MONGO_URL, {
-    maxPoolSize: 20,
+    maxPoolSize: Number(process.env.MONGO_MAX_POOL_SIZE ?? 20),
   });
   await client.connect();
   db = client.db(DB_NAME);
