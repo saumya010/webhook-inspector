@@ -61,6 +61,26 @@ services:
       timeout: 5s
       retries: 10
 
+  # MCP server is a stdio process spawned by an MCP client (Claude Desktop,
+  # Claude Code, etc.), not a long-running network service — `profiles`
+  # keeps it out of the default `docker compose up`. Run it directly with
+  # `docker compose run --rm mcp` or point a client at
+  # `docker compose run --rm -T mcp` as the launch command.
+  mcp:
+    build: .
+    command: ["node", "dist/mcp/server.js"]
+    profiles: ["tools"]
+    stdin_open: true
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      MONGO_DB_NAME: webhook_inspector
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   jaeger:
     image: jaegertracing/all-in-one:1
     ports:

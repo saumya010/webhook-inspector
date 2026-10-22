@@ -7,7 +7,7 @@ API for debugging failed integrations.
 
 See [`PRD.md`](./PRD.md) for the full design doc, rationale, and milestones.
 
-## Status: M1 + M2 + M3 complete
+## Status: M1 + M2 + M3 + M4 complete — all PRD milestones built
 
 What exists right now:
 
@@ -46,9 +46,17 @@ What exists right now:
   and replay-window rejection), idempotency key derivation, retry
   classification (table-driven), backoff/jitter bounds — 35 tests passing
 
-Not yet built (see PRD milestone M4): the MCP server and k6 load tests (the
-latter is actually already done — see `k6/RESULTS.md` — M4 just hasn't had
-the MCP server built yet).
+- MCP server (`src/mcp/server.ts`, stdio transport) with 5 tools —
+  `list_endpoints`, `find_deliveries`, `get_delivery`, `delivery_stats`,
+  `replay_delivery` — verified end to end over real stdio JSON-RPC
+  (`initialize`, `tools/list`, and real `tools/call` round trips against
+  live data), including the error paths (unknown endpoint, invalid ID) and
+  the one side-effecting tool actually re-queueing a real BullMQ job. Run it
+  with `npm run mcp` or `docker compose run --rm mcp` (excluded from the
+  default `docker compose up` via a compose profile, since it's a stdio
+  process an MCP client spawns, not a long-running network service)
+- k6 load tests — see `k6/RESULTS.md` for the 3 scenarios and the real
+  bottleneck investigation
 
 ## Running it
 
