@@ -58,6 +58,34 @@ What exists right now:
 - k6 load tests — see `k6/RESULTS.md` for the 3 scenarios and the real
   bottleneck investigation
 
+### Post-verification hardening
+
+Four gaps surfaced during Verification.md's live question bank (Phase 8)
+were closed and re-verified live, not just patched:
+
+- **`Retry-After` is now honored.** `sendDelivery` parses the header
+  (seconds or HTTP-date form) and the worker uses it over the computed
+  exponential backoff when present, still bounded by `max_backoff_ms`.
+  Verified against a real `429` + `Retry-After: 3` response — the actual
+  retry fired in ~5s, not the ~10s the configured exponential minimum
+  would have produced.
+- **Bulk replay.** `POST /api/deliveries/replay-bulk` and the MCP
+  `replay_dead_deliveries` tool re-queue multiple `dead` deliveries at once
+  (scoped by endpoint/time range, capped per call) — the real answer to
+  "a destination was down for 6 hours, now what" instead of replaying one
+  at a time. Verified recovering 5 simulated dead deliveries in one call.
+- **Per-endpoint concurrency isolation.** `src/delivery/endpoint-concurrency.ts`
+  caps each endpoint to 3 of the worker's shared delivery slots, so one
+  slow or hung destination can't starve every other endpoint's deliveries.
+  Verified live: a hung destination occupying its 3-slot cap didn't delay
+  an unrelated endpoint's delivery, which completed in 18ms.
+- **Leader election for periodic jobs.** `src/delivery/leader-lock.ts` uses
+  a Redis lock (30s TTL, atomic check-and-renew via a Lua script) so only
+  one worker replica runs the stale-claim sweep and retry scanner at a
+  time — without it, N replicas would each run the same idempotent
+  queries redundantly. Verified with two real concurrently-running worker
+  processes: only the elected leader logged the stale-claim recovery.
+
 ## Running it
 
 ```bash

@@ -112,6 +112,82 @@ export async function registerDeliveryRoutes(app: FastifyInstance): Promise<void
     },
   );
 
+  interface ReplayBulkBody {
+    endpoint_id?: string;
+    status?: DeliveryStatus;
+    since?: string;
+    until?: string;
+    limit?: number;
+  }
+
+  const MAX_REPLAY_BULK = 500;
+  const DEFAULT_REPLAY_BULK_LIMIT = 100;
+
+  app.post(
+    "/api/deliveries/replay-bulk",
+    async (request: FastifyRequest<{ Body: ReplayBulkBody }>, reply) => {
+      const body = request.body ?? {};
+      const filter: Record<string, unknown> = {
+        // Default to 'dead' — bulk-replaying anything else (e.g. currently
+        // 'delivering') would be a real correctness hazard, not a
+        // convenience. Caller can override explicitly if they really mean
+        // to target a different status.
+        status: body.status ?? "dead",
+      };
+
+      if (body.endpoint_id) {
+        if (!ObjectId.isValid(body.endpoint_id)) {
+          return reply.code(400).send({ error: "invalid_endpoint_id" });
+        }
+        filter.endpoint_id = new ObjectId(body.endpoint_id);
+      }
+
+      const receivedAtFilter: Record<string, Date> = {};
+      if (body.since) receivedAtFilter.$gte = new Date(body.since);
+      if (body.until) receivedAtFilter.$lte = new Date(body.until);
+      if (Object.keys(receivedAtFilter).length > 0) {
+        filter.received_at = receivedAtFilter;
+      }
+
+      const limit = Math.min(body.limit ?? DEFAULT_REPLAY_BULK_LIMIT, MAX_REPLAY_BULK);
+
+      // Resolve the exact set of IDs first, then act on that fixed set —
+      // an unscoped filter (no endpoint_id, no time range) is a real
+      // mass-recovery operation (PRD §15's "6-hour outage" scenario), not
+      // something to run as an open-ended updateMany against a moving
+      // target. The `limit` bounds blast radius per call; call again for
+      // more.
+      const targets = await deliveries()
+        .find(filter, { projection: { _id: 1 } })
+        .limit(limit)
+        .toArray();
+      const ids = targets.map((d) => d._id).filter((id): id is ObjectId => id !== undefined);
+
+      if (ids.length === 0) {
+        return reply.send({ data: { matched: 0, replayed: 0, delivery_ids: [] } });
+      }
+
+      await deliveries().updateMany(
+        { _id: { $in: ids } },
+        { $set: { status: "queued", claimed_at: null, next_retry_at: null } },
+      );
+      // Enqueue sequentially, not Promise.all — this can be hundreds of
+      // jobs; unbounded concurrent BullMQ adds are an unnecessary spike
+      // against Redis for an operation that isn't latency-sensitive.
+      for (const id of ids) {
+        await enqueueDelivery(id.toString());
+      }
+
+      return reply.send({
+        data: {
+          matched: ids.length,
+          replayed: ids.length,
+          delivery_ids: ids.map((id) => id.toString()),
+        },
+      });
+    },
+  );
+
   app.get(
     "/api/deliveries/stats",
     async (

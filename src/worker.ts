@@ -8,12 +8,14 @@ import { createServer } from "node:http";
 import { registry } from "./observability/metrics.js";
 import { connectMongo, getDb } from "./db/client.js";
 import { getRedisConnection } from "./queue/connection.js";
-import { DELIVERY_QUEUE_NAME, type DeliveryJobData } from "./queue/delivery-queue.js";
+import { DELIVERY_QUEUE_NAME, enqueueDelivery, type DeliveryJobData } from "./queue/delivery-queue.js";
 import { claimDelivery, sweepStaleClaims } from "./delivery/claim.js";
 import { scanDueRetries } from "./delivery/retry-scanner.js";
 import { recordAttempt } from "./delivery/record-attempt.js";
 import { sendDelivery } from "./delivery/send.js";
 import { classifyAttempt, computeBackoffMs } from "./delivery/retry.js";
+import { tryAcquireEndpointSlot, releaseEndpointSlot } from "./delivery/endpoint-concurrency.js";
+import { tryBecomeLeader } from "./delivery/leader-lock.js";
 import {
   webhookDeliveryAttemptsTotal,
   webhookDeliveryDuration,
@@ -91,70 +93,105 @@ async function deliverOneAttempt(job: Job<DeliveryJobData>): Promise<void> {
   const destination = enabledDestinations[0];
   if (!destination) return; // unreachable given the length check above, satisfies TS
 
-  const retryPolicy = endpoint?.retry_policy ?? {
-    max_attempts: 5,
-    backoff_base_ms: 1000,
-    backoff_factor: 2,
-    max_backoff_ms: 300_000,
-  };
+  const endpointId = delivery.endpoint_id.toString();
+  const SLOT_RETRY_DELAY_MS = 500;
 
-  const attemptNumber = delivery.attempt_count + 1;
-  const startedAt = new Date();
-  const endpointSlug = endpoint?.slug ?? "unknown";
-  const endDeliveryTimer = webhookDeliveryDuration.startTimer({ endpoint: endpointSlug });
-  // Explicit span, not auto-instrumentation: @opentelemetry/instrumentation-http
-  // only patches node:http/https — sendDelivery uses the global `fetch`
-  // (undici), which that package does not intercept. Checked the package's
-  // own description before assuming otherwise.
-  const result = await withSpan("http.request", () =>
-    sendDelivery(destination.url, delivery.request.body_raw, {
-      "Content-Type": "application/json",
-    }),
-  );
-  endDeliveryTimer();
-
-  const classification = classifyAttempt({
-    httpStatus: result.httpStatus,
-    errorType: result.errorType,
-  });
-  webhookDeliveryAttemptsTotal.inc({ endpoint: endpointSlug, classification });
-
-  const attempt: DeliveryAttempt = {
-    n: attemptNumber,
-    started_at: startedAt,
-    finished_at: new Date(),
-    destination_url: destination.url,
-    response_status: result.httpStatus,
-    response_time_ms: result.responseTimeMs,
-    error:
-      result.errorType !== null
-        ? { type: result.errorType, message: result.errorMessage ?? "" }
-        : null,
-    classification,
-  };
-
-  let nextStatus: DeliveryStatus;
-  let nextRetryAt: Date | null = null;
-
-  if (classification === "success") {
-    nextStatus = "delivered";
-  } else if (classification === "permanent" || attemptNumber >= retryPolicy.max_attempts) {
-    nextStatus = "dead";
-    webhookDeliveriesDeadTotal.inc({
-      endpoint: endpointSlug,
-      reason: classification === "permanent" ? "permanent_failure" : "max_attempts_exceeded",
-    });
-  } else {
-    nextStatus = "queued";
-    const backoffMs = computeBackoffMs(attemptNumber, retryPolicy);
-    nextRetryAt = new Date(Date.now() + backoffMs);
+  if (!tryAcquireEndpointSlot(endpointId)) {
+    // Every in-flight slot for this endpoint is taken — release the claim
+    // back to 'queued' (not 'delivering' with nothing happening) and
+    // re-enqueue with a short delay, rather than holding one of the
+    // worker's global concurrency slots open while just waiting.
+    await withSpan("mongo.record_attempt", () =>
+      timeMongoOp("deliveries", "release_claim", async () => {
+        const deliveries = getDb().collection<DeliveryDoc>("deliveries");
+        await deliveries.updateOne(
+          { _id: new ObjectId(deliveryId) },
+          { $set: { status: "queued", claimed_at: null } },
+        );
+      }),
+    );
+    await enqueueDelivery(deliveryId, SLOT_RETRY_DELAY_MS);
+    return;
   }
 
-  await withSpan("mongo.record_attempt", () =>
-    timeMongoOp("deliveries", "record_attempt", () =>
-      recordAttempt(new ObjectId(deliveryId), attempt, nextStatus, nextRetryAt),
-    ),
-  );
+  try {
+    const retryPolicy = endpoint?.retry_policy ?? {
+      max_attempts: 5,
+      backoff_base_ms: 1000,
+      backoff_factor: 2,
+      max_backoff_ms: 300_000,
+    };
+
+    const attemptNumber = delivery.attempt_count + 1;
+    const startedAt = new Date();
+    const endpointSlug = endpoint?.slug ?? "unknown";
+    const endDeliveryTimer = webhookDeliveryDuration.startTimer({ endpoint: endpointSlug });
+    // Explicit span, not auto-instrumentation: @opentelemetry/instrumentation-http
+    // only patches node:http/https — sendDelivery uses the global `fetch`
+    // (undici), which that package does not intercept. Checked the package's
+    // own description before assuming otherwise.
+    const result = await withSpan("http.request", () =>
+      sendDelivery(destination.url, delivery.request.body_raw, {
+        "Content-Type": "application/json",
+      }),
+    );
+    endDeliveryTimer();
+
+    const classification = classifyAttempt({
+      httpStatus: result.httpStatus,
+      errorType: result.errorType,
+    });
+    webhookDeliveryAttemptsTotal.inc({ endpoint: endpointSlug, classification });
+
+    const attempt: DeliveryAttempt = {
+      n: attemptNumber,
+      started_at: startedAt,
+      finished_at: new Date(),
+      destination_url: destination.url,
+      response_status: result.httpStatus,
+      response_time_ms: result.responseTimeMs,
+      error:
+        result.errorType !== null
+          ? { type: result.errorType, message: result.errorMessage ?? "" }
+          : null,
+      classification,
+    };
+
+    let nextStatus: DeliveryStatus;
+    let nextRetryAt: Date | null = null;
+
+    if (classification === "success") {
+      nextStatus = "delivered";
+    } else if (classification === "permanent" || attemptNumber >= retryPolicy.max_attempts) {
+      nextStatus = "dead";
+      webhookDeliveriesDeadTotal.inc({
+        endpoint: endpointSlug,
+        reason: classification === "permanent" ? "permanent_failure" : "max_attempts_exceeded",
+      });
+    } else {
+      nextStatus = "queued";
+      // Honor a destination's Retry-After hint over our own exponential
+      // schedule when present — but still bounded by max_backoff_ms, so a
+      // destination can't force an arbitrarily long wait. No jitter applied
+      // here: the destination gave us a specific number: adding jitter would
+      // work against the reason it sent one (e.g. a known rate-limit reset
+      // time), unlike our own formula where jitter prevents synchronized
+      // retries.
+      const backoffMs =
+        result.retryAfterMs !== null
+          ? Math.min(result.retryAfterMs, retryPolicy.max_backoff_ms)
+          : computeBackoffMs(attemptNumber, retryPolicy);
+      nextRetryAt = new Date(Date.now() + backoffMs);
+    }
+
+    await withSpan("mongo.record_attempt", () =>
+      timeMongoOp("deliveries", "record_attempt", () =>
+        recordAttempt(new ObjectId(deliveryId), attempt, nextStatus, nextRetryAt),
+      ),
+    );
+  } finally {
+    releaseEndpointSlot(endpointId);
+  }
 }
 
 const QUEUE_DEPTH_STATES: DeliveryStatus[] = ["queued", "delivering", "failed", "dead"];
@@ -210,18 +247,30 @@ async function main() {
 
   // Stale-claim sweep: a worker that dies mid-delivery leaves its claimed
   // delivery stuck in 'delivering' forever unless something resets it.
+  // Gated on leader election — with N worker replicas, only one actually
+  // runs this per tick; the rest skip it. Each replica still attempts the
+  // lock on every tick, so if the current leader dies, another picks up
+  // leadership within one lock TTL (30s) rather than needing any manual
+  // failover.
   setInterval(() => {
-    sweepStaleClaims().then((count) => {
-      if (count > 0) console.log(`Reclaimed ${count} stale delivery claim(s)`);
+    tryBecomeLeader().then((isLeader) => {
+      if (!isLeader) return;
+      return sweepStaleClaims().then((count) => {
+        if (count > 0) console.log(`Reclaimed ${count} stale delivery claim(s)`);
+      });
     }).catch((err) => console.error("Stale-claim sweep failed:", err));
   }, SWEEP_INTERVAL_MS);
 
   // Retry scanner: a retryable failure sets next_retry_at in the future
   // but doesn't re-add a queue job itself — this is what actually acts on
   // the {status, next_retry_at} index rather than just leaving it unused.
+  // Same leader gating as the sweep above.
   setInterval(() => {
-    scanDueRetries().then((count) => {
-      if (count > 0) console.log(`Re-enqueued ${count} due retry(ies)`);
+    tryBecomeLeader().then((isLeader) => {
+      if (!isLeader) return;
+      return scanDueRetries().then((count) => {
+        if (count > 0) console.log(`Re-enqueued ${count} due retry(ies)`);
+      });
     }).catch((err) => console.error("Retry scan failed:", err));
   }, RETRY_SCAN_INTERVAL_MS);
 

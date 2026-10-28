@@ -276,6 +276,101 @@ export function createMcpServer(): McpServer {
     },
   );
 
+  const MAX_REPLAY_BULK = 500;
+  const DEFAULT_REPLAY_BULK_LIMIT = 100;
+
+  server.registerTool(
+    "replay_dead_deliveries",
+    {
+      title: "Replay dead deliveries in bulk",
+      description:
+        "Re-enqueue multiple 'dead' deliveries at once, scoped by endpoint and/or time range — " +
+        "use this for mass recovery after an outage (e.g. 'the destination was down for 6 hours, " +
+        "replay everything that died during that window') rather than calling replay_delivery " +
+        "once per delivery. This is side-effecting and will cause real HTTP requests to the " +
+        "destination for every matched delivery. Always confirm the scope (endpoint, time range, " +
+        "expected count) with the user before calling this — an unscoped call could replay a " +
+        "large number of deliveries at once.",
+      inputSchema: {
+        endpoint_slug: z.string().optional().describe("Limit to one endpoint's deliveries"),
+        since: z.string().optional().describe("ISO 8601 timestamp — only deliveries received after this"),
+        until: z.string().optional().describe("ISO 8601 timestamp — only deliveries received before this"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_REPLAY_BULK)
+          .optional()
+          .describe(`Max deliveries to replay in this call, default ${DEFAULT_REPLAY_BULK_LIMIT}, max ${MAX_REPLAY_BULK}. Call again for more.`),
+      },
+      annotations: {
+        destructiveHint: true,
+        idempotentHint: false,
+      },
+    },
+    async ({ endpoint_slug, since, until, limit }) => {
+      const db = getDb();
+      const deliveries = db.collection<DeliveryDoc>("deliveries");
+      const endpoints = db.collection<EndpointDoc>("endpoints");
+
+      const filter: Record<string, unknown> = { status: "dead" };
+      if (endpoint_slug) {
+        const endpoint = await endpoints.findOne({ slug: endpoint_slug });
+        if (!endpoint) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No endpoint found with slug '${endpoint_slug}'. Call list_endpoints to see valid slugs.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        filter.endpoint_id = endpoint._id;
+      }
+
+      const receivedAtFilter: Record<string, Date> = {};
+      if (since) receivedAtFilter.$gte = new Date(since);
+      if (until) receivedAtFilter.$lte = new Date(until);
+      if (Object.keys(receivedAtFilter).length > 0) {
+        filter.received_at = receivedAtFilter;
+      }
+
+      const targets = await deliveries
+        .find(filter, { projection: { _id: 1 } })
+        .limit(limit ?? DEFAULT_REPLAY_BULK_LIMIT)
+        .toArray();
+      const ids = targets.map((d) => d._id).filter((id): id is ObjectId => id !== undefined);
+
+      if (ids.length === 0) {
+        return {
+          content: [{ type: "text", text: "No dead deliveries matched the given scope." }],
+        };
+      }
+
+      await deliveries.updateMany(
+        { _id: { $in: ids } },
+        { $set: { status: "queued", claimed_at: null, next_retry_at: null } },
+      );
+      for (const id of ids) {
+        await enqueueDelivery(id.toString());
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Replayed ${ids.length} dead delivery(ies).` +
+              (ids.length === (limit ?? DEFAULT_REPLAY_BULK_LIMIT)
+                ? " This may not be all of them — call again with the same scope to check for more."
+                : ""),
+          },
+        ],
+      };
+    },
+  );
+
   return server;
 }
 

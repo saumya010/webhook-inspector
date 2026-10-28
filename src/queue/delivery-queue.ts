@@ -27,7 +27,7 @@ export function getDeliveryQueue(): Queue<DeliveryJobData> {
   return queue;
 }
 
-export async function enqueueDelivery(deliveryId: string): Promise<void> {
+export async function enqueueDelivery(deliveryId: string, delayMs = 0): Promise<void> {
   const carrier: Record<string, string> = {};
   propagation.inject(context.active(), carrier);
 
@@ -42,6 +42,11 @@ export async function enqueueDelivery(deliveryId: string): Promise<void> {
       // See src/worker.ts for why.
       removeOnComplete: true,
       removeOnFail: true,
+      // delayMs > 0 is used when a job couldn't acquire its per-endpoint
+      // concurrency slot (src/delivery/endpoint-concurrency.ts) — a short
+      // delay before retrying avoids a hot loop of claim-release-reenqueue
+      // against a busy endpoint.
+      ...(delayMs > 0 ? { delay: delayMs } : {}),
     },
   );
 }
