@@ -1,119 +1,140 @@
 # Webhook Delivery Inspector
 
-Self-hostable service that receives webhooks from any provider, verifies
-them, stores every delivery with its full request and attempt history,
-forwards to configured destinations with retries, and exposes a queryable
-API for debugging failed integrations.
+A self-hostable service for receiving, verifying, and reliably delivering
+webhooks — with full observability and an agent-facing debugging surface.
 
-See [`PRD.md`](./PRD.md) for the full design doc, rationale, and milestones.
+Point any provider at it. It verifies the signature, stores the full
+request and delivery history, forwards it to your destination with retries
+and backoff, and gives you an API (and an MCP server) to find out exactly
+what happened to any given delivery.
 
-## Status: M1 + M2 + M3 + M4 complete — all PRD milestones built
+**Read the [write-up](./WRITEUP.md)** for the design decisions and the
+measurements behind them — the unique-index idempotency guard, the atomic
+claim, why the attempts array is capped at 20, the ESR index ordering, and
+the load test results. **Read the [PRD](./PRD.md)** for the original design
+spec and what was deliberately left out.
 
-What exists right now:
+## Why
 
-- TypeScript (`strict: true`), Fastify, MongoDB official driver (no Mongoose)
-- `endpoints` and `deliveries` collections with the full index set from the PRD
-- `POST /ingest/:slug` — raw-body capture, per-scheme signature verification
-  (Stripe, GitHub, generic HMAC), idempotent insert via a unique index
-- `GET/POST/PATCH /api/endpoints`, `GET /api/deliveries` (cursor-paginated,
-  filterable), `GET /api/deliveries/:id`, `POST /api/deliveries/:id/replay`,
-  `GET /api/deliveries/stats` (aggregation pipeline)
-- `/healthz`, `/readyz` (Mongo + Redis)
-- BullMQ queue + worker: atomic claim (`findOneAndUpdate` with `status:
-  'queued'` in the filter), real HTTP delivery to configured destinations,
-  retry classification + jittered exponential backoff, a retry scanner that
-  re-enqueues deliveries once `next_retry_at` passes, a stale-claim sweep
-  that reclaims deliveries stuck in `delivering` after a dead worker
-- `/metrics` on both `app` (ingest counters/histogram) and `worker` (its own
-  endpoint, port 3001 — a separate process means a separate registry;
-  delivery attempts, delivery duration, queue depth, dead-letter count,
-  Mongo operation duration), all confirmed emitting under real traffic, not
-  just defined
-- OpenTelemetry tracing: a full ingest-through-delivery trace is one linked
-  trace in Jaeger (`webhook.ingest` → `verify_signature`/`persist`/`enqueue`,
-  and `webhook.deliver` → `mongo.claim`/`http.request`/`mongo.record_attempt`),
-  with trace context propagated across the Redis queue boundary so the two
-  halves aren't disconnected traces; `trace_id` persisted on the delivery
-  document for API→trace lookup
-- Prometheus scraping both services; Grafana dashboard (ingest rate, delivery
-  success rate by endpoint, p50/p95/p99 delivery latency, queue depth,
-  dead-letter rate, Mongo op duration)
-- Docker Compose stack (`app` + `worker` + `mongo` + `redis` + `jaeger` +
-  `prometheus` + `grafana`), verified booting end-to-end and delivering a
-  real webhook through to a live destination, including the full
-  retry → dead → replay → delivered path
-- Vitest unit suite: signature verification (incl. timing-safe comparison
-  and replay-window rejection), idempotency key derivation, retry
-  classification (table-driven), backoff/jitter bounds — 35 tests passing
+Webhook integrations fail in ways that are hard to debug after the fact:
+a delivery silently retries into a dead end, a destination rate-limits you
+and you retry too fast anyway, two workers race on the same delivery, an
+outage kills a few hundred deliveries and replaying them one at a time is
+tedious. This project exists to make all of that inspectable and correct —
+not just "receive a POST and call a URL."
 
-- MCP server (`src/mcp/server.ts`, stdio transport) with 5 tools —
-  `list_endpoints`, `find_deliveries`, `get_delivery`, `delivery_stats`,
-  `replay_delivery` — verified end to end over real stdio JSON-RPC
-  (`initialize`, `tools/list`, and real `tools/call` round trips against
-  live data), including the error paths (unknown endpoint, invalid ID) and
-  the one side-effecting tool actually re-queueing a real BullMQ job. Run it
-  with `npm run mcp` or `docker compose run --rm mcp` (excluded from the
-  default `docker compose up` via a compose profile, since it's a stdio
-  process an MCP client spawns, not a long-running network service)
-- k6 load tests — see `k6/RESULTS.md` for the 3 scenarios and the real
-  bottleneck investigation
+## What it does
 
-### Post-verification hardening
+- **Verifies signatures** for Stripe, GitHub, and a generic HMAC scheme —
+  timing-safe comparison, replay-window rejection.
+- **Never loses or duplicates a delivery.** Idempotency is enforced by a
+  MongoDB unique index, not an application-level check — concurrent
+  identical webhooks can't create duplicate records.
+- **Delivers reliably.** A BullMQ-backed worker claims deliveries
+  atomically, retries transient failures with jittered exponential
+  backoff (honoring a destination's `Retry-After` header when it sends
+  one), and gives up cleanly on permanent failures.
+- **Recovers from outages.** Dead deliveries can be replayed individually
+  or in bulk, scoped by endpoint and time range.
+- **Isolates noisy destinations.** One slow or hung destination can't
+  starve delivery to every other endpoint.
+- **Is fully observable.** Prometheus metrics, and a single Jaeger trace
+  spanning a delivery from ingest through its final attempt.
+- **Is debuggable by an agent, not just a human.** An MCP server exposes
+  the same lookups (and a guarded replay action) as tools.
 
-Four gaps surfaced during Verification.md's live question bank (Phase 8)
-were closed and re-verified live, not just patched:
-
-- **`Retry-After` is now honored.** `sendDelivery` parses the header
-  (seconds or HTTP-date form) and the worker uses it over the computed
-  exponential backoff when present, still bounded by `max_backoff_ms`.
-  Verified against a real `429` + `Retry-After: 3` response — the actual
-  retry fired in ~5s, not the ~10s the configured exponential minimum
-  would have produced.
-- **Bulk replay.** `POST /api/deliveries/replay-bulk` and the MCP
-  `replay_dead_deliveries` tool re-queue multiple `dead` deliveries at once
-  (scoped by endpoint/time range, capped per call) — the real answer to
-  "a destination was down for 6 hours, now what" instead of replaying one
-  at a time. Verified recovering 5 simulated dead deliveries in one call.
-- **Per-endpoint concurrency isolation.** `src/delivery/endpoint-concurrency.ts`
-  caps each endpoint to 3 of the worker's shared delivery slots, so one
-  slow or hung destination can't starve every other endpoint's deliveries.
-  Verified live: a hung destination occupying its 3-slot cap didn't delay
-  an unrelated endpoint's delivery, which completed in 18ms.
-- **Leader election for periodic jobs.** `src/delivery/leader-lock.ts` uses
-  a Redis lock (30s TTL, atomic check-and-renew via a Lua script) so only
-  one worker replica runs the stale-claim sweep and retry scanner at a
-  time — without it, N replicas would each run the same idempotent
-  queries redundantly. Verified with two real concurrently-running worker
-  processes: only the elected leader logged the stale-claim recovery.
-
-## Running it
+## Quick start
 
 ```bash
+git clone https://github.com/saumya010/webhook-inspector.git
+cd webhook-inspector
 docker compose up --build
 ```
 
+That starts the API, the delivery worker, MongoDB, Redis, Jaeger,
+Prometheus, and Grafana.
+
 ```bash
+# health checks
 curl http://localhost:3000/healthz
 curl http://localhost:3000/readyz
-curl http://localhost:3000/metrics      # app metrics
-curl http://localhost:3001/metrics      # worker metrics
 
+# register an endpoint to receive webhooks at
 curl -X POST http://localhost:3000/api/endpoints \
   -H "Authorization: Bearer dev-local-key" \
   -H "Content-Type: application/json" \
-  -d '{"name":"My Endpoint","slug":"my-endpoint","provider":"generic_hmac"}'
+  -d '{
+    "name": "My App",
+    "slug": "my-app",
+    "provider": "generic_hmac",
+    "verification": { "secret_ref": "WEBHOOK_SECRET_MY_APP" },
+    "destinations": [{ "url": "https://example.com/webhooks", "enabled": true }]
+  }'
+
+# point your provider at:
+#   POST http://localhost:3000/ingest/my-app
 ```
 
-- Jaeger UI: http://localhost:16686
-- Prometheus UI: http://localhost:9090
-- Grafana: http://localhost:3002 (anonymous admin access, local dev only)
+Something sending it will now show up at `GET /api/deliveries`, with its
+full attempt history at `GET /api/deliveries/:id`.
 
-For local dev without Docker: `npm install`, copy `.env.example` to `.env`,
-run a local MongoDB on `27017`, then `npm run dev`.
+| Dashboard | URL |
+|---|---|
+| Jaeger (traces) | http://localhost:16686 |
+| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3002 |
 
-## Tests
+Local dev without Docker: `npm install`, copy `.env.example` to `.env`, run
+MongoDB on `27017`, then `npm run dev` (and `npm run worker:dev` for the
+delivery worker in a second terminal).
+
+## API
+
+| | |
+|---|---|
+| `POST /ingest/:slug` | Where providers send webhooks. Public — the signature is the credential. |
+| `GET/POST/PATCH /api/endpoints` | Manage endpoints |
+| `GET /api/deliveries` | List/filter deliveries (cursor-paginated) |
+| `GET /api/deliveries/:id` | Full detail, including attempt history |
+| `POST /api/deliveries/:id/replay` | Re-queue one delivery |
+| `POST /api/deliveries/replay-bulk` | Re-queue many dead deliveries at once, scoped by endpoint/time range |
+| `GET /api/deliveries/stats` | Aggregated counts by status |
+| `GET /metrics` | Prometheus exposition (also on the worker, port `3001`) |
+
+All `/api/*` routes require `Authorization: Bearer <API_KEY>` (set via the
+`API_KEY` env var; defaults to `dev-local-key` locally).
+
+## MCP server
+
+For an LLM agent to triage deliveries directly:
+
+```bash
+npm run mcp
+# or
+docker compose run --rm mcp
+```
+
+Exposes `list_endpoints`, `find_deliveries`, `get_delivery`,
+`delivery_stats`, `replay_delivery`, and `replay_dead_deliveries` as MCP
+tools over stdio.
+
+## Testing it
 
 ```bash
 npm run typecheck
-npm test
+npm test            # 42 Vitest unit tests
 ```
+
+Load test results (sustained ingest, burst, delivery throughput under a
+simulated slow destination) are in [`k6/RESULTS.md`](./k6/RESULTS.md).
+
+## Stack
+
+TypeScript (strict), Fastify, the official MongoDB driver (deliberately not
+an ODM), BullMQ/Redis, OpenTelemetry, Prometheus/Grafana, the MCP SDK.
+Docker Compose for everything. No Kubernetes, no Kafka, no multi-tenancy —
+see the PRD's non-goals for why.
+
+## License
+
+MIT
